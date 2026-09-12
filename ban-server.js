@@ -13,8 +13,8 @@ const db = new Database(process.env.DB_PATH || path.join(__dirname, 'ban-tool.db
 db.pragma('journal_mode = WAL');
 db.exec(`
 CREATE TABLE IF NOT EXISTS admins (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS bans (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL CHECK(type IN ('user','ip','email','username')), target TEXT NOT NULL, reason TEXT DEFAULT '', expires_at TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, active INTEGER NOT NULL DEFAULT 1);
-CREATE TABLE IF NOT EXISTS whitelist (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL CHECK(type IN ('user','ip','email','username')), target TEXT NOT NULL, reason TEXT DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS bans (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL CHECK(type IN ('user','ip','email','username','whatsapp')), target TEXT NOT NULL, reason TEXT DEFAULT '', expires_at TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, active INTEGER NOT NULL DEFAULT 1);
+CREATE TABLE IF NOT EXISTS whitelist (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL CHECK(type IN ('user','ip','email','username','whatsapp')), target TEXT NOT NULL, reason TEXT DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 `);
 
 app.use(express.json());
@@ -28,7 +28,12 @@ function auth(req, res, next) {
   catch { return res.status(401).json({ error: 'Invalid or expired token' }); }
 }
 
+function normalizeWhatsApp(value) {
+  return String(value || '').replace(/[^0-9+]/g, '').replace(/^00/, '+');
+}
+
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'ban-index.html')));
+app.get('/ban-tool', (req, res) => res.sendFile(path.join(__dirname, 'public', 'ban-index.html')));
 
 app.post('/api/auth/register', async (req, res) => {
   const { username, email, password } = req.body || {};
@@ -54,7 +59,8 @@ app.get('/api/stats', auth, (req, res) => {
   const active = db.prepare("SELECT COUNT(*) n FROM bans WHERE active=1 AND (expires_at IS NULL OR expires_at > datetime('now'))").get().n;
   const users = db.prepare("SELECT COUNT(*) n FROM bans WHERE type='user'").get().n;
   const ips = db.prepare("SELECT COUNT(*) n FROM bans WHERE type='ip'").get().n;
-  res.json({ total, active, users, ips });
+  const whatsapp = db.prepare("SELECT COUNT(*) n FROM bans WHERE type='whatsapp'").get().n;
+  res.json({ total, active, users, ips, whatsapp });
 });
 
 app.get('/api/integrations', auth, (req, res) => res.json({
@@ -90,26 +96,47 @@ app.post('/webhooks/instagram', (req, res) => { console.log('Instagram webhook e
 
 app.get('/api/bans', auth, (req, res) => {
   const { type, q } = req.query; let sql = 'SELECT * FROM bans WHERE 1=1'; const args = [];
-  if (type && ['user','ip','email','username'].includes(type)) { sql += ' AND type=?'; args.push(type); }
+  if (type && ['user','ip','email','username','whatsapp'].includes(type)) { sql += ' AND type=?'; args.push(type); }
   if (q) { sql += ' AND (target LIKE ? OR reason LIKE ?)'; args.push(`%${q}%`, `%${q}%`); }
   sql += ' ORDER BY id DESC LIMIT 200'; res.json(db.prepare(sql).all(...args));
 });
+
 app.post('/api/bans', auth, (req, res) => {
-  const { type, target, reason = '', expiresAt = null } = req.body || {};
-  if (!['user','ip','email','username'].includes(type) || !target?.trim()) return res.status(400).json({ error: 'Valid type and target are required' });
+  let { type, target, reason = '', expiresAt = null } = req.body || {};
+  if (type === 'whatsapp') target = normalizeWhatsApp(target);
+  if (!['user','ip','email','username','whatsapp'].includes(type) || !target?.trim()) return res.status(400).json({ error: 'Valid type and target are required' });
+  if (type === 'whatsapp' && !/^\+[1-9][0-9]{7,14}$/.test(target)) return res.status(400).json({ error: 'Use international WhatsApp format, for example +2547XXXXXXXX' });
   const result = db.prepare('INSERT INTO bans (type,target,reason,expires_at) VALUES (?,?,?,?)').run(type, target.trim(), reason.trim(), expiresAt || null);
   res.json(db.prepare('SELECT * FROM bans WHERE id=?').get(result.lastInsertRowid));
 });
+
+app.post('/api/bans/whatsapp', auth, (req, res) => {
+  const target = normalizeWhatsApp(req.body?.number);
+  const reason = String(req.body?.reason || '').trim();
+  const expiresAt = req.body?.expiresAt || null;
+  if (!/^\+[1-9][0-9]{7,14}$/.test(target)) return res.status(400).json({ error: 'Use international WhatsApp format, for example +2547XXXXXXXX' });
+  const result = db.prepare('INSERT INTO bans (type,target,reason,expires_at) VALUES (?,?,?,?)').run('whatsapp', target, reason, expiresAt);
+  res.json({ ok: true, ban: db.prepare('SELECT * FROM bans WHERE id=?').get(result.lastInsertRowid) });
+});
+
+app.post('/api/bans/whatsapp/check', (req, res) => {
+  const target = normalizeWhatsApp(req.body?.number);
+  const ban = db.prepare("SELECT * FROM bans WHERE type='whatsapp' AND target=? AND active=1 AND (expires_at IS NULL OR expires_at > datetime('now')) ORDER BY id DESC LIMIT 1").get(target);
+  res.json({ number: target, banned: !!ban, ban: ban || null });
+});
+
 app.delete('/api/bans/:id', auth, (req, res) => { db.prepare('UPDATE bans SET active=0 WHERE id=?').run(req.params.id); res.json({ ok: true }); });
 app.post('/api/bans/check', (req, res) => {
-  const { type, target } = req.body || {};
+  let { type, target } = req.body || {};
+  if (type === 'whatsapp') target = normalizeWhatsApp(target);
   const ban = db.prepare("SELECT * FROM bans WHERE type=? AND target=? AND active=1 AND (expires_at IS NULL OR expires_at > datetime('now')) ORDER BY id DESC LIMIT 1").get(type, target);
   res.json({ banned: !!ban, ban: ban || null });
 });
 app.get('/api/whitelist', auth, (req, res) => res.json(db.prepare('SELECT * FROM whitelist ORDER BY id DESC').all()));
 app.post('/api/whitelist', auth, (req, res) => {
-  const { type, target, reason = '' } = req.body || {};
-  if (!['user','ip','email','username'].includes(type) || !target?.trim()) return res.status(400).json({ error: 'Valid type and target are required' });
+  let { type, target, reason = '' } = req.body || {};
+  if (type === 'whatsapp') target = normalizeWhatsApp(target);
+  if (!['user','ip','email','username','whatsapp'].includes(type) || !target?.trim()) return res.status(400).json({ error: 'Valid type and target are required' });
   const result = db.prepare('INSERT INTO whitelist (type,target,reason) VALUES (?,?,?)').run(type, target.trim(), reason.trim());
   res.json(db.prepare('SELECT * FROM whitelist WHERE id=?').get(result.lastInsertRowid));
 });
