@@ -12,29 +12,9 @@ const db = new Database(process.env.DB_PATH || path.join(__dirname, 'ban-tool.db
 
 db.pragma('journal_mode = WAL');
 db.exec(`
-CREATE TABLE IF NOT EXISTS admins (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  username TEXT UNIQUE NOT NULL,
-  email TEXT UNIQUE NOT NULL,
-  password_hash TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS bans (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  type TEXT NOT NULL CHECK(type IN ('user','ip','email','username')),
-  target TEXT NOT NULL,
-  reason TEXT DEFAULT '',
-  expires_at TEXT,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  active INTEGER NOT NULL DEFAULT 1
-);
-CREATE TABLE IF NOT EXISTS whitelist (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  type TEXT NOT NULL CHECK(type IN ('user','ip','email','username')),
-  target TEXT NOT NULL,
-  reason TEXT DEFAULT '',
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
+CREATE TABLE IF NOT EXISTS admins (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS bans (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL CHECK(type IN ('user','ip','email','username')), target TEXT NOT NULL, reason TEXT DEFAULT '', expires_at TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, active INTEGER NOT NULL DEFAULT 1);
+CREATE TABLE IF NOT EXISTS whitelist (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL CHECK(type IN ('user','ip','email','username')), target TEXT NOT NULL, reason TEXT DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 `);
 
 app.use(express.json());
@@ -52,8 +32,7 @@ app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'ban-inde
 
 app.post('/api/auth/register', async (req, res) => {
   const { username, email, password } = req.body || {};
-  if (!username || !email || !password || password.length < 8)
-    return res.status(400).json({ error: 'Username, email and an 8+ character password are required' });
+  if (!username || !email || !password || password.length < 8) return res.status(400).json({ error: 'Username, email and an 8+ character password are required' });
   try {
     const hash = await bcrypt.hash(password, 12);
     const result = db.prepare('INSERT INTO admins (username,email,password_hash) VALUES (?,?,?)').run(username.trim(), email.trim().toLowerCase(), hash);
@@ -78,33 +57,55 @@ app.get('/api/stats', auth, (req, res) => {
   res.json({ total, active, users, ips });
 });
 
-app.get('/api/bans', auth, (req, res) => {
-  const { type, q } = req.query;
-  let sql = 'SELECT * FROM bans WHERE 1=1'; const args = [];
-  if (type && ['user','ip','email','username'].includes(type)) { sql += ' AND type=?'; args.push(type); }
-  if (q) { sql += ' AND (target LIKE ? OR reason LIKE ?)'; args.push(`%${q}%`, `%${q}%`); }
-  sql += ' ORDER BY id DESC LIMIT 200';
-  res.json(db.prepare(sql).all(...args));
+app.get('/api/integrations', auth, (req, res) => res.json({
+  whatsapp: !!(process.env.WHATSAPP_ACCESS_TOKEN && process.env.WHATSAPP_PHONE_NUMBER_ID),
+  instagram: !!(process.env.INSTAGRAM_ACCESS_TOKEN && process.env.INSTAGRAM_ACCOUNT_ID)
+}));
+
+app.post('/api/integrations/test/:platform', auth, async (req, res) => {
+  const p = req.params.platform;
+  if (p === 'whatsapp') {
+    if (!process.env.WHATSAPP_ACCESS_TOKEN || !process.env.WHATSAPP_PHONE_NUMBER_ID) return res.status(400).json({ error: 'WhatsApp is not configured in Render environment variables.' });
+    return res.json({ message: 'WhatsApp configuration is present. Connect the Meta webhook and verify the phone number in your Meta app to enable live events.' });
+  }
+  if (p === 'instagram') {
+    if (!process.env.INSTAGRAM_ACCESS_TOKEN || !process.env.INSTAGRAM_ACCOUNT_ID) return res.status(400).json({ error: 'Instagram is not configured in Render environment variables.' });
+    return res.json({ message: 'Instagram configuration is present. Connect the Meta webhook and verify the professional account in your Meta app to enable live events.' });
+  }
+  res.status(404).json({ error: 'Unknown platform' });
 });
 
+app.get('/webhooks/whatsapp', (req, res) => {
+  const mode = req.query['hub.mode']; const token = req.query['hub.verify_token']; const challenge = req.query['hub.challenge'];
+  if (mode === 'subscribe' && token && token === process.env.META_VERIFY_TOKEN) return res.status(200).send(challenge);
+  res.sendStatus(403);
+});
+app.post('/webhooks/whatsapp', (req, res) => { console.log('WhatsApp webhook event received'); res.sendStatus(200); });
+app.get('/webhooks/instagram', (req, res) => {
+  const mode = req.query['hub.mode']; const token = req.query['hub.verify_token']; const challenge = req.query['hub.challenge'];
+  if (mode === 'subscribe' && token && token === process.env.META_VERIFY_TOKEN) return res.status(200).send(challenge);
+  res.sendStatus(403);
+});
+app.post('/webhooks/instagram', (req, res) => { console.log('Instagram webhook event received'); res.sendStatus(200); });
+
+app.get('/api/bans', auth, (req, res) => {
+  const { type, q } = req.query; let sql = 'SELECT * FROM bans WHERE 1=1'; const args = [];
+  if (type && ['user','ip','email','username'].includes(type)) { sql += ' AND type=?'; args.push(type); }
+  if (q) { sql += ' AND (target LIKE ? OR reason LIKE ?)'; args.push(`%${q}%`, `%${q}%`); }
+  sql += ' ORDER BY id DESC LIMIT 200'; res.json(db.prepare(sql).all(...args));
+});
 app.post('/api/bans', auth, (req, res) => {
   const { type, target, reason = '', expiresAt = null } = req.body || {};
   if (!['user','ip','email','username'].includes(type) || !target?.trim()) return res.status(400).json({ error: 'Valid type and target are required' });
   const result = db.prepare('INSERT INTO bans (type,target,reason,expires_at) VALUES (?,?,?,?)').run(type, target.trim(), reason.trim(), expiresAt || null);
   res.json(db.prepare('SELECT * FROM bans WHERE id=?').get(result.lastInsertRowid));
 });
-
-app.delete('/api/bans/:id', auth, (req, res) => {
-  db.prepare('UPDATE bans SET active=0 WHERE id=?').run(req.params.id);
-  res.json({ ok: true });
-});
-
+app.delete('/api/bans/:id', auth, (req, res) => { db.prepare('UPDATE bans SET active=0 WHERE id=?').run(req.params.id); res.json({ ok: true }); });
 app.post('/api/bans/check', (req, res) => {
   const { type, target } = req.body || {};
   const ban = db.prepare("SELECT * FROM bans WHERE type=? AND target=? AND active=1 AND (expires_at IS NULL OR expires_at > datetime('now')) ORDER BY id DESC LIMIT 1").get(type, target);
   res.json({ banned: !!ban, ban: ban || null });
 });
-
 app.get('/api/whitelist', auth, (req, res) => res.json(db.prepare('SELECT * FROM whitelist ORDER BY id DESC').all()));
 app.post('/api/whitelist', auth, (req, res) => {
   const { type, target, reason = '' } = req.body || {};
